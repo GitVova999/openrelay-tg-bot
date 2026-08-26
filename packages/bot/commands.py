@@ -147,7 +147,7 @@ async def ask_private(message: Message, command) -> None:  # type: ignore[no-unt
         )
         return
     if not q:
-        q = "О чём этот пост? Прокомментируй."
+        q = DEFAULT_COMMENT_Q
     await _do_ask_in_dm(message, question=q, reply_focus=reply_focus)
 
 
@@ -162,7 +162,7 @@ async def ask_public(message: Message, command, bot: Bot) -> None:  # type: igno
         )
         return
     if not q:
-        q = "О чём этот пост? Прокомментируй."
+        q = DEFAULT_COMMENT_Q
     await _do_ask_in_channel(message, bot, question=q, reply_focus=reply_focus)
 
 
@@ -185,6 +185,9 @@ def _extract_reply_focus(message: Message) -> str | None:
     return f"{header}\n{text}"
 
 
+DEFAULT_COMMENT_Q = "О чём этот пост? Прокомментируй."
+
+
 async def _generate_ask_answer(
     channel_tg_id: int,
     question: str,
@@ -192,8 +195,18 @@ async def _generate_ask_answer(
 ) -> dict:
     """Run the full /ask pipeline; return {ok, header, body, chunks, lang}.
 
-    Kept separate from the send layer so both DM and channel handlers can
-    format-and-route the same result without duplicating the LLM call.
+    Two prompt strategies picked by whether reply_focus is present:
+      - `reply_focus` given + user asked the default "explain this post"
+        question → focused-comment prompt.  We do NOT stuff channel-wide
+        context; the anchor IS the context.  Short output limit.
+      - `reply_focus` given + user asked a specific question → focused
+        prompt with the anchor as primary + small (raw-only) recent
+        context for background.
+      - No `reply_focus` → the general RAG-over-digests path.
+
+    Prompt shape matters here: MiniMax and similar weak-instruction models
+    will happily echo the anchor verbatim if it's buried inside a big
+    'CONTEXT ... QUESTION' block.
     """
     async with session() as db:
         ch = (await db.execute(
@@ -202,31 +215,56 @@ async def _generate_ask_answer(
     if ch is None:
         return {"ok": False, "error": "Канал не зарегистрирован в базе."}
 
-    context, stats = await build_context_for_query(ch.id, recent_hours=48)
-    if not context:
-        return {"ok": False, "error": "В канале пока нет распарсенных сообщений."}
-
-    # Fire background digest warm (bounded per-call) so next /ask has more.
-    asyncio.create_task(_background_digest_warm(ch.id, max_new=5))
-
-    focus_block = ""
-    if reply_focus:
-        focus_block = (
-            "ПОСТ-АНКОР (пользователь спрашивает про этот конкретный пост, "
-            "используй его как основной фокус ответа):\n"
-            f"===\n{reply_focus}\n===\n\n"
-        )
-
-    user_prompt = (
-        f"Ниже — контекст канала: {stats['raw_msgs']} свежих сообщ. за 48ч "
-        f"+ {stats['digest_days']} дневных дайджестов старше 48ч.\n"
-        + (focus_block if focus_block else "")
-        + "Ответь на вопрос пользователя, опираясь на пост-анкор (если есть) "
-          "и контекст канала. Если ответа нет — так и скажи. Кратко, по делу.\n\n"
-        f"КОНТЕКСТ:\n{context}\n\n"
-        f"ВОПРОС: {question}"
-    )
     system_prompt = build_system_prompt(ch, task="assistant")
+    lang = (ch.language or "ru").lower()
+    max_tokens = 1500
+    stats = {"raw_msgs": 0, "digest_days": 0}
+
+    if reply_focus:
+        # Fire background digest catch-up regardless (grows quality for
+        # non-reply queries later) but do NOT wait on it.
+        asyncio.create_task(_background_digest_warm(ch.id, max_new=5))
+
+        if question.strip() == DEFAULT_COMMENT_Q or not question.strip():
+            # Pure "explain / comment on this" — tightest possible prompt.
+            user_prompt = (
+                "Прокомментируй пост ниже: одно короткое мнение или наблюдение, "
+                "2-4 предложения. Никогда не пересказывай пост дословно. "
+                "Никогда не начинай с пересказа. Пиши сразу свою оценку/мысль.\n\n"
+                f"ПОСТ:\n{reply_focus}"
+            )
+            max_tokens = 350
+        else:
+            # User has a specific question ABOUT the post; give tiny background.
+            context, stats = await build_context_for_query(ch.id, recent_hours=48)
+            recent = ""
+            if stats["raw_msgs"]:
+                # Only the last-48h raw messages, no old digests. Keeps prompt
+                # small and focused; the post is the true anchor.
+                recent = f"\n\nФОН (последние 48ч канала, для контекста):\n{context}"
+            user_prompt = (
+                "Ответь на вопрос пользователя, опираясь ПРЕЖДЕ ВСЕГО на пост ниже. "
+                "Не пересказывай пост, отвечай по существу вопроса. Кратко и по делу.\n\n"
+                f"ПОСТ:\n{reply_focus}\n\n"
+                f"ВОПРОС: {question}"
+                + recent
+            )
+            max_tokens = 800
+    else:
+        # General question → RAG over digests + recent raw.
+        context, stats = await build_context_for_query(ch.id, recent_hours=48)
+        if not context:
+            return {"ok": False, "error": "В канале пока нет распарсенных сообщений."}
+        asyncio.create_task(_background_digest_warm(ch.id, max_new=5))
+        user_prompt = (
+            f"Ниже — контекст канала: {stats['raw_msgs']} свежих сообщ. за 48ч "
+            f"+ {stats['digest_days']} дневных дайджестов старше 48ч.\n"
+            "Ответь на вопрос пользователя, опираясь ТОЛЬКО на этот контекст. "
+            "Если ответа нет — так и скажи. Кратко, по делу.\n\n"
+            f"КОНТЕКСТ:\n{context}\n\n"
+            f"ВОПРОС: {question}"
+        )
+        max_tokens = 1500
 
     try:
         j = await chat_completion(
@@ -235,7 +273,7 @@ async def _generate_ask_answer(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=1500,
+            max_tokens=max_tokens,
             temperature=0.4,
             stop=STOP_SEQUENCES,
         )
@@ -243,10 +281,10 @@ async def _generate_ask_answer(
         return {"ok": False, "error": f"Инференс упал: <code>{clean_llm_output(str(e))}</code>"}
 
     raw = j["choices"][0]["message"]["content"]
-    lang = (ch.language or "ru").lower()
     answer = clean_llm_output(raw, expected_lang=lang)
+    answer = _drop_echoed_anchor(answer, reply_focus)
     if not answer:
-        answer = "(модель вернула пустой ответ после reasoning — переформулируй)"
+        answer = "(модель вернула пустой ответ или скопировала пост — переформулируй)"
     usage = j.get("usage", {})
     header = (
         f"<b>❓ {clean_llm_output(question, expected_lang=lang)}</b>\n"
@@ -261,6 +299,39 @@ async def _generate_ask_answer(
         "chunks": ui.truncate_for_telegram(header + answer),
         "lang": lang,
     }
+
+
+def _drop_echoed_anchor(answer: str, reply_focus: str | None) -> str:
+    """If the model started by echoing the anchor post, strip that prefix.
+
+    MiniMax M2.x sometimes reproduces the anchor verbatim before (or
+    instead of) commenting.  We detect a fuzzy overlap on the first
+    ~120 chars and slice.  Conservative: leaves the answer alone if
+    there's no clear echo.
+    """
+    if not reply_focus or not answer:
+        return answer
+    # Compare the first non-blank paragraph of the answer to the anchor's body.
+    ans_head = answer.strip()[:200].lower()
+    focus_body = reply_focus.split("\n", 1)[-1] if "\n" in reply_focus else reply_focus
+    focus_head = focus_body.strip()[:200].lower()
+    if not focus_head:
+        return answer
+    # Cheap overlap: shared prefix of at least 40 chars.
+    common = 0
+    for a, b in zip(ans_head, focus_head):
+        if a != b:
+            break
+        common += 1
+    if common < 40:
+        return answer
+    # Echo detected. Find the end of the echoed paragraph (blank line) and
+    # keep everything after it.
+    parts = answer.split("\n\n", 1)
+    if len(parts) == 2 and parts[1].strip():
+        return parts[1].strip()
+    # Whole answer was just the echo → nothing useful.
+    return ""
 
 
 async def _do_ask_in_dm(
