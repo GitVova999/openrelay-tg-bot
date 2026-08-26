@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenRelay TG Bot (channel AI assistant)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/openrelay-tg-bot
+EnvironmentFile=/opt/openrelay-tg-bot/.env
+ExecStart=/opt/openrelay-tg-bot/.venv/bin/python -m packages.bot.main
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/openrelay-tg-bot.log
+StandardError=append:/var/log/openrelay-tg-bot.log
+
+[Install]
+WantedBy=multi-user.target
