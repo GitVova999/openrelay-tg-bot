@@ -62,18 +62,19 @@ def stub_need_start(bot_username: str) -> str:
     return STUB_NEED_START.format(bot=bot_username)
 
 
-def format_summary(res: dict) -> str:
+def format_summary(res: dict, language: str = "ru") -> str:
     """Turn summarize_channel(...) result into a nice HTML message.
 
     We escape the model's output so any residual HTML-looking bits in the
-    summary don't crash the aiogram HTML parser.
+    summary don't crash the aiogram HTML parser, and we cut leaked English
+    chain-of-thought when the channel language is non-English.
     """
     from packages.context_svc.sanitize import clean_llm_output
     header = (
         f"<b>📝 Саммари</b> · {res['msg_count']} сообщ. · {res['period']}\n"
         f"<i>Модель: {res['model']} · {res['in_tokens']}→{res['out_tokens']} tok</i>\n"
     )
-    return header + "\n" + clean_llm_output(res["summary"])
+    return header + "\n" + clean_llm_output(res["summary"], expected_lang=language)
 
 
 def truncate_for_telegram(text: str, limit: int = 4000) -> list[str]:

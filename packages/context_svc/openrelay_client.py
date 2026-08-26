@@ -48,6 +48,7 @@ async def chat_completion(
     messages: list[dict[str, str]],
     max_tokens: int = 1024,
     temperature: float = 0.4,
+    stop: list[str] | None = None,
     private_key: str | None = None,
 ) -> dict[str, Any]:
     """POST to OpenRelay /v1/premium/chat/completions with automatic x402 payment.
@@ -62,12 +63,14 @@ async def chat_completion(
         key = "0x" + key
 
     url = OPENRELAY_BASE + PREMIUM_PATH
-    body = {
+    body: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
+    if stop:
+        body["stop"] = stop
 
     async with _build_paying_client(key) as http:
         r = await http.post(url, json=body)

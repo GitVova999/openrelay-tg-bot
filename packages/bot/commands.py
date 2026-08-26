@@ -31,7 +31,7 @@ from packages.common.db import session
 from packages.common.models import Channel, Message as DbMessage
 from packages.context_svc.digest import build_context_for_query, ensure_digests
 from packages.context_svc.openrelay_client import chat_completion
-from packages.context_svc.prompts import build_system_prompt
+from packages.context_svc.prompts import STOP_SEQUENCES, build_system_prompt
 from packages.context_svc.sanitize import clean_llm_output
 from packages.context_svc.summarize import summarize_channel
 
@@ -116,7 +116,11 @@ async def _do_summarize(msg: Message, hours: int, source_chat_id: int | None = N
     if not res["ok"]:
         await thinking.edit_text(f"⚠️ {clean_llm_output(res['error'])}")
         return
-    text = ui.format_summary(res)
+    # Pick channel language for smart reasoning-strip in summary render.
+    async with session() as db:
+        _ch = (await db.execute(select(Channel).where(Channel.tg_chat_id == chat_id))).scalar_one_or_none()
+    lang = (_ch.language if _ch else "ru")
+    text = ui.format_summary(res, language=lang)
     chunks = ui.truncate_for_telegram(text)
     await thinking.edit_text(chunks[0])
     for extra in chunks[1:]:
@@ -196,22 +200,25 @@ async def _do_ask(msg: Message, question: str, source_chat_id: int | None = None
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=800,
+            max_tokens=1500,
             temperature=0.4,
+            stop=STOP_SEQUENCES,
         )
     except Exception as e:
         await thinking.edit_text(f"⚠️ Инференс упал: <code>{clean_llm_output(str(e))}</code>")
         return
 
     raw = j["choices"][0]["message"]["content"]
-    answer = clean_llm_output(raw)
+    lang = (ch.language or "ru").lower()
+    answer = clean_llm_output(raw, expected_lang=lang)
     if not answer:
         answer = "(модель вернула пустой ответ после reasoning — переформулируй)"
     usage = j.get("usage", {})
     header = (
-        f"<b>❓ {clean_llm_output(question)}</b>\n"
+        f"<b>❓ {clean_llm_output(question, expected_lang=lang)}</b>\n"
         f"<i>{usage.get('prompt_tokens', 0)}→{usage.get('completion_tokens', 0)} tok · "
-        f"raw:{stats['raw_msgs']} digests:{stats['digest_days']}</i>\n\n"
+        f"raw:{stats['raw_msgs']} digests:{stats['digest_days']} · "
+        f"{j.get('model', '?')}</i>\n\n"
     )
     chunks = ui.truncate_for_telegram(header + answer)
     await thinking.edit_text(chunks[0])
@@ -262,15 +269,20 @@ async def faq(message: Message, command) -> None:  # type: ignore[no-untyped-def
                     f"Вопрос: {q}"
                 )},
             ],
-            max_tokens=120,
+            max_tokens=300,
             temperature=0.2,
+            stop=STOP_SEQUENCES,
         )
     except Exception as e:
         await thinking.edit_text(f"⚠️ <code>{clean_llm_output(str(e))}</code>")
         return
-    ans = clean_llm_output(j["choices"][0]["message"]["content"].strip())
+    lang = (ch.language or "ru").lower() if ch else "ru"
+    ans = clean_llm_output(j["choices"][0]["message"]["content"].strip(), expected_lang=lang)
     kb = ui.deep_link("ask", q) if message.chat.type != PRIVATE else None
-    await thinking.edit_text(f"<b>❓ {clean_llm_output(q)}</b>\n{ans}", reply_markup=kb)
+    await thinking.edit_text(
+        f"<b>❓ {clean_llm_output(q, expected_lang=lang)}</b>\n{ans}",
+        reply_markup=kb,
+    )
 
 
 # ─────────────────────────────────────────────────────────── /balance

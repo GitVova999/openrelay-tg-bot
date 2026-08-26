@@ -117,7 +117,7 @@ async def summarize_channel(
         prompt_body = context
         est_in = cstats["context_tokens_est"]
 
-    from packages.context_svc.prompts import build_system_prompt
+    from packages.context_svc.prompts import STOP_SEQUENCES, build_system_prompt
     period = f"с {msgs[0].sent_at:%Y-%m-%d} по {msgs[-1].sent_at:%Y-%m-%d}"
     user_prompt = (
         f"Ниже — контекст канала за период {period}.\n"
@@ -136,6 +136,7 @@ async def summarize_channel(
             ],
             max_tokens=max_output_tokens,
             temperature=0.4,
+            stop=STOP_SEQUENCES,
         )
     except Exception as e:
         return {"ok": False, "error": f"инференс упал: {e!s}"[:400]}

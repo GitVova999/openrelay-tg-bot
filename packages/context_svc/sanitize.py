@@ -44,6 +44,60 @@ def escape_for_html(text: str) -> str:
     return escaped
 
 
-def clean_llm_output(text: str) -> str:
-    """One-shot cleaner: strip reasoning + escape for TG HTML."""
-    return escape_for_html(strip_reasoning(text))
+_LEAKED_REASONING_STARTERS = (
+    "we need to", "we should", "let me", "let us", "let's think",
+    "first, let", "actually,", "the user is", "the user wants",
+    "the user asks", "the user has", "so, the user", "ok, ",
+    "okay, ", "so, we", "so we ", "i need to", "i should",
+    "i'll ", "i will ", "looking at",
+)
+
+_RU_CHARS_RE = re.compile(r"[а-яА-ЯёЁ]")
+_BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+", re.MULTILINE)
+
+
+def strip_leaked_reasoning(text: str, expected_lang: str = "ru") -> str:
+    """Cut leading paragraphs that look like model's chain-of-thought.
+
+    Trigger: expected_lang=='ru' AND the first paragraph opens with a known
+    English reasoning marker AND has very few Cyrillic chars.  We walk down
+    paragraph by paragraph until we find one that looks like the real answer
+    (bullet list, or Cyrillic-dense prose).
+
+    Conservative — if unsure, we return the original text.  Only bites when
+    the model has clearly derailed.
+    """
+    if expected_lang != "ru":
+        return text
+    paragraphs = text.split("\n\n")
+    stripped = 0
+    for i, p in enumerate(paragraphs):
+        head = p.strip().lower()[:80]
+        if not head:
+            stripped = i + 1
+            continue
+        # Looks like a real Russian answer? Keep everything from here.
+        if _BULLET_RE.search(p):
+            return "\n\n".join(paragraphs[i:]).strip()
+        ru_ratio = len(_RU_CHARS_RE.findall(p)) / max(len(p), 1)
+        if ru_ratio > 0.10:  # dense Cyrillic = actual answer
+            return "\n\n".join(paragraphs[i:]).strip()
+        # English-reasoning marker at the start of the paragraph?
+        if any(head.startswith(s) for s in _LEAKED_REASONING_STARTERS):
+            stripped = i + 1
+            continue
+        # Sparse Cyrillic + no marker → still probably reasoning, keep chopping.
+        if ru_ratio < 0.02 and len(p) > 40:
+            stripped = i + 1
+            continue
+        # Otherwise stop — this paragraph might be the answer.
+        break
+    result = "\n\n".join(paragraphs[stripped:]).strip()
+    return result or text  # never return empty from this pass
+
+
+def clean_llm_output(text: str, expected_lang: str = "ru") -> str:
+    """One-shot cleaner: strip <think> tags + leaked reasoning + escape HTML."""
+    text = strip_reasoning(text)
+    text = strip_leaked_reasoning(text, expected_lang=expected_lang)
+    return escape_for_html(text)
