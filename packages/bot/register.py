@@ -33,13 +33,18 @@ async def on_membership_change(evt: ChatMemberUpdated) -> None:
         return
 
     title = chat.title or chat.first_name or ""
+    # If admin posted anonymously ("send as channel"), from_user is GroupAnonymousBot
+    # (id 1087968824) or similar — that's NOT the human owner, don't store it.
+    owner_id = None
+    if evt.from_user and not evt.from_user.is_bot:
+        owner_id = evt.from_user.id
     async with session() as s:
         row = (await s.execute(select(Channel).where(Channel.tg_chat_id == chat.id))).scalar_one_or_none()
         if row is None:
             row = Channel(
                 tg_chat_id=chat.id,
                 title=title,
-                owner_user_id=evt.from_user.id if evt.from_user else None,
+                owner_user_id=owner_id,
             )
             s.add(row)
             await s.flush()

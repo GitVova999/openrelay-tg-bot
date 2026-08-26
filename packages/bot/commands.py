@@ -20,14 +20,14 @@ from datetime import datetime
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from packages.bot import ui
 from packages.common.db import session
-from packages.common.models import Channel
+from packages.common.models import Channel, Message as DbMessage
 from packages.context_svc.openrelay_client import chat_completion
 from packages.context_svc.summarize import (
     _fetch_window,
@@ -283,16 +283,32 @@ def _parse_hours(args: str | None) -> int:
     return int(m.group(1)) if m else 24
 
 
-async def _resolve_default_channel(_user_id: int) -> int | None:
-    """MVP: return the only registered channel if there's exactly one.
+async def _resolve_default_channel(user_id: int) -> int | None:
+    """Pick a default channel for a DM command.
 
-    Later: per-user "current channel" state, or force user to specify.
+    Priority: (1) channels this user owns, (2) channel with the most messages
+    (i.e. the one with real content to summarize/ask), (3) None.  MVP — a
+    proper per-user "current channel" selector lands with the docker tier.
     """
     async with session() as s:
-        rows = (await s.execute(select(Channel))).scalars().all()
-    if len(rows) == 1:
-        return rows[0].tg_chat_id
-    return None
+        # 1. Owned by this user
+        if user_id:
+            owned = (await s.execute(
+                select(Channel).where(Channel.owner_user_id == user_id)
+            )).scalars().first()
+            if owned is not None:
+                return owned.tg_chat_id
+
+        # 2. Fall back to whichever channel has the most ingested messages.
+        stmt = (
+            select(Channel.tg_chat_id)
+            .join(DbMessage, DbMessage.channel_id == Channel.id, isouter=True)
+            .group_by(Channel.id)
+            .order_by(func.count(DbMessage.id).desc())
+            .limit(1)
+        )
+        row = (await s.execute(stmt)).first()
+        return row[0] if row else None
 
 
 async def _stub_and_relay_to_dm(
@@ -311,10 +327,23 @@ async def _stub_and_relay_to_dm(
         await channel_msg.reply("Не могу определить пользователя.")
         return
 
+    # Anonymous-admin posts arrive as GroupAnonymousBot — TG blocks bot-to-bot
+    # DMs, so we can't route the answer that way.  Give them a deep-link so
+    # they can run the same command in DM from their own account.
+    if user.is_bot:
+        await channel_msg.reply(
+            "Ты пишешь от имени канала/анонимно, я не могу ответить в лс "
+            "боту. Открой ЛС со мной со своего аккаунта и повтори:",
+            reply_markup=ui.deep_link(verb, arg),
+        )
+        return
+
     # Try to DM first — if it fails, we know user hasn't Start'd.
     try:
         dm_msg = await bot.send_message(user.id, f"⏳ обрабатываю /{verb}…")
-    except TelegramForbiddenError:
+    except (TelegramForbiddenError, TelegramBadRequest):
+        # TelegramForbiddenError = user blocked / never started;
+        # TelegramBadRequest fires on "chat not found" for the same reason.
         await channel_msg.reply(
             ui.stub_need_start(me.username),
             reply_markup=ui.deep_link(verb, arg),
