@@ -7,7 +7,8 @@ requires-python = ">=3.12"
 dependencies = [
     # TG
     "aiogram>=3.13,<4",
-    "telethon>=1.36,<2",
+    "pyrogram>=2.0",
+    "tgcrypto>=1.2",  # C-accelerated crypto for pyrogram (~5× faster)
     # DB
     "sqlalchemy[asyncio]>=2.0.34,<3",
     "asyncpg>=0.29",
