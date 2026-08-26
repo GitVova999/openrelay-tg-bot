@@ -117,19 +117,23 @@ async def summarize_channel(
         prompt_body = context
         est_in = cstats["context_tokens_est"]
 
+    from packages.context_svc.prompts import build_system_prompt
     period = f"с {msgs[0].sent_at:%Y-%m-%d} по {msgs[-1].sent_at:%Y-%m-%d}"
-    prompt = (
-        f"Ты — аналитик TG-каналов. Ниже — контекст канала «{ch.title}» за период {period}.\n"
+    user_prompt = (
+        f"Ниже — контекст канала за период {period}.\n"
         "Сделай краткое саммари: главные темы, повторяющиеся мотивы, тон, что-либо необычное.\n"
-        "Формат: 5-8 буллетов через дефис. Русский язык. Без вступительной фразы, "
-        "без блоков <think>, сразу буллеты.\n\n"
+        "Формат: 5-8 буллетов через дефис. Без вступительной фразы, сразу буллеты.\n\n"
         + prompt_body
     )
+    system_prompt = build_system_prompt(ch, task="summary")
 
     try:
         j = await chat_completion(
             model=s.model_large,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
             max_tokens=max_output_tokens,
             temperature=0.4,
         )

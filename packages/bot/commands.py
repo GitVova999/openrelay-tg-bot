@@ -14,6 +14,7 @@ want their questions/answers cluttering the channel.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime
@@ -30,6 +31,7 @@ from packages.common.db import session
 from packages.common.models import Channel, Message as DbMessage
 from packages.context_svc.digest import build_context_for_query, ensure_digests
 from packages.context_svc.openrelay_client import chat_completion
+from packages.context_svc.prompts import build_system_prompt
 from packages.context_svc.sanitize import clean_llm_output
 from packages.context_svc.summarize import summarize_channel
 
@@ -165,35 +167,35 @@ async def _do_ask(msg: Message, question: str, source_chat_id: int | None = None
         await thinking.edit_text("Канал не зарегистрирован в базе.")
         return
 
-    # 1. Materialize daily digests up to yesterday if any are missing.
-    try:
-        new_digests = await ensure_digests(ch.id)
-        if new_digests:
-            await thinking.edit_text(f"⏳ Собираю дайджест ({new_digests} дн.)…")
-    except Exception as e:
-        log.warning("digest build failed: %s", e)
-
-    # 2. Build compact context (recent raw + digests for older days).
+    # 1. Build context from whatever digests + raw are already available.
+    #    Missing digests are backfilled in the BACKGROUND — first /ask on a
+    #    fresh channel is answered with whatever we've got, and quality grows
+    #    over subsequent asks as digests fill in.
     context, stats = await build_context_for_query(ch.id, recent_hours=48)
     if not context:
         await thinking.edit_text("В канале пока нет распарсенных сообщений.")
         return
 
-    prompt = (
-        f"Ты — AI-помощник канала «{ch.title}». Ниже — контекст: "
-        f"свежие {stats['raw_msgs']} сообщ. за 48ч + {stats['digest_days']} "
-        "дневных дайджестов старше 48ч.\n"
+    # Kick off digest catch-up (up to 5 new per pass; caps per-call cost).
+    asyncio.create_task(_background_digest_warm(ch.id, max_new=5))
+
+    user_prompt = (
+        f"Ниже — контекст канала: {stats['raw_msgs']} свежих сообщ. за 48ч "
+        f"+ {stats['digest_days']} дневных дайджестов старше 48ч.\n"
         "Ответь на вопрос пользователя, опираясь ТОЛЬКО на этот контекст. "
-        "Если ответа в контексте нет — прямо скажи. Русский, кратко, по делу. "
-        "Никаких <think>-блоков.\n\n"
+        "Если ответа нет — так и скажи. Кратко, по делу.\n\n"
         f"КОНТЕКСТ:\n{context}\n\n"
         f"ВОПРОС: {question}"
     )
+    system_prompt = build_system_prompt(ch, task="assistant")
 
     try:
         j = await chat_completion(
             model="deepseek-ai/DeepSeek-V4-Flash-0731",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
             max_tokens=800,
             temperature=0.4,
         )
@@ -202,9 +204,9 @@ async def _do_ask(msg: Message, question: str, source_chat_id: int | None = None
         return
 
     raw = j["choices"][0]["message"]["content"]
-    answer = clean_llm_output(raw)  # strips <think> and escapes remaining HTML
+    answer = clean_llm_output(raw)
     if not answer:
-        answer = "(модель ответила пустой строкой после reasoning-блока — попробуй переформулировать)"
+        answer = "(модель вернула пустой ответ после reasoning — переформулируй)"
     usage = j.get("usage", {})
     header = (
         f"<b>❓ {clean_llm_output(question)}</b>\n"
@@ -215,6 +217,15 @@ async def _do_ask(msg: Message, question: str, source_chat_id: int | None = None
     await thinking.edit_text(chunks[0])
     for extra in chunks[1:]:
         await msg.answer(extra)
+
+
+async def _background_digest_warm(channel_pk: int, max_new: int = 5) -> None:
+    try:
+        n = await ensure_digests(channel_pk, max_new=max_new)
+        if n:
+            log.info("background digest warm: channel=%s +%d", channel_pk, n)
+    except Exception:
+        log.exception("background digest warm failed")
 
 
 # ─────────────────────────────────────────────────────────── /faq
@@ -232,17 +243,25 @@ async def faq(message: Message, command) -> None:  # type: ignore[no-untyped-def
         await message.reply("Пример: <code>/faq что такое x402?</code>")
         return
     thinking = await message.reply("⏳")
+    # Resolve channel to pick up per-channel language setting (falls back to ru).
+    chat_id = message.chat.id if message.chat.type != PRIVATE else \
+              await _resolve_default_channel(message.from_user.id if message.from_user else 0)
+    async with session() as db:
+        ch = (await db.execute(select(Channel).where(Channel.tg_chat_id == chat_id))).scalar_one_or_none() \
+             if chat_id else None
+    system_prompt = build_system_prompt(ch, task="faq") if ch else (
+        "Ты помощник. Отвечай на русском. Никаких <think>-блоков."
+    )
     try:
         j = await chat_completion(
             model="deepseek-ai/DeepSeek-V4-Flash-0731",
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Ответь на вопрос одной-двумя фразами. "
-                    "Максимум 40 слов. Только суть. Русский язык.\n\n"
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": (
+                    "Ответь на вопрос одной-двумя фразами. Максимум 40 слов. Только суть.\n\n"
                     f"Вопрос: {q}"
-                ),
-            }],
+                )},
+            ],
             max_tokens=120,
             temperature=0.2,
         )

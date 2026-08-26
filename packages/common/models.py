@@ -54,6 +54,12 @@ class Channel(Base):
     revenue_share_bps: Mapped[int] = mapped_column(Integer, default=2000)  # 20% default
     per_user_cap_usdmicro: Mapped[int] = mapped_column(BigInteger, default=50_000)  # $0.05
     setup_paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Per-channel behavior config — applied to every LLM call for this channel.
+    # `system_prompt` (if set) fully overrides the generated one.
+    language: Mapped[str] = mapped_column(String(8), default="ru")
+    tone: Mapped[str] = mapped_column(String(256), default="")
+    topics: Mapped[str] = mapped_column(String(512), default="")
+    system_prompt: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     messages: Mapped[list["Message"]] = relationship(back_populates="channel")

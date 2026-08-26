@@ -17,6 +17,7 @@ from aiogram.enums import ParseMode
 from packages.bot import ui
 from packages.bot.commands import router as commands_router
 from packages.bot.register import router as register_router
+from packages.bot.settings_cmd import router as settings_router
 from packages.common.config import settings
 
 log = logging.getLogger("bot")
@@ -37,6 +38,7 @@ async def main() -> None:
     )
     dp = Dispatcher()
     dp.include_router(register_router)  # my_chat_member → auto-register channels
+    dp.include_router(settings_router)  # /settings (owner-only)
     dp.include_router(commands_router)  # /start /summarize /ask /faq /balance
 
     me = await bot.get_me()

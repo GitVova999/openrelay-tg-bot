@@ -25,11 +25,12 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from packages.common.db import session
 from packages.common.models import Channel, Digest, Message
 from packages.context_svc.openrelay_client import chat_completion
+from packages.context_svc.prompts import build_system_prompt
 from packages.context_svc.sanitize import strip_reasoning
 
 log = logging.getLogger("digest")
@@ -39,14 +40,14 @@ log = logging.getLogger("digest")
 # usually improve answer quality for aggregate questions.
 DAY_DIGEST_MAX_TOKENS = 500
 
-_DAY_PROMPT = """Ниже — все сообщения канала «{title}» за {day}.
-Сделай **компактный дайджест дня** для последующего RAG-поиска. Формат:
+_DAY_USER_PROMPT = """Ниже — все сообщения канала за {day}.
+Сделай **компактный дайджест дня** для последующего поиска. Формат:
 
 - одна вводная строка: настроение и главная тема дня в 8-15 словах
 - 3-8 буллетов конкретных фактов/событий/решений/цитат, каждый до 25 слов
 - если есть заметные имена, тикеры, суммы, ссылки — упоминай их дословно
 
-Никакого вступления, никакого <think>. Русский язык.
+Никакого вступления, никакого <think>-блока, сразу дайджест.
 
 ===
 {transcript}
@@ -97,10 +98,14 @@ async def _generate_day_digest(channel: Channel, day: date) -> Digest | None:
         return None
 
     transcript = _format_messages(msgs)
-    prompt = _DAY_PROMPT.format(title=channel.title, day=day.isoformat(), transcript=transcript)
+    user_prompt = _DAY_USER_PROMPT.format(day=day.isoformat(), transcript=transcript)
+    system_prompt = build_system_prompt(channel, task="digest")
     j = await chat_completion(
         model="deepseek-ai/DeepSeek-V4-Flash-0731",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
         max_tokens=DAY_DIGEST_MAX_TOKENS,
         temperature=0.3,
     )
@@ -133,39 +138,67 @@ async def _generate_day_digest(channel: Channel, day: date) -> Digest | None:
             )).scalar_one_or_none()
 
 
-async def ensure_digests(channel_pk: int, upto: date | None = None) -> int:
-    """Backfill missing daily digests from oldest ingested day up to `upto`
-    (defaults to yesterday — today changes too often to cache).
+# Per-channel lock — prevents two concurrent /ask calls or one bot + one CLI
+# process from generating the same digest twice and burning tokens.
+import asyncio as _asyncio
+_channel_locks: dict[int, _asyncio.Lock] = {}
 
-    Returns the number of digests generated in this call (0 if all up-to-date).
+
+async def ensure_digests(
+    channel_pk: int,
+    upto: date | None = None,
+    *,
+    max_new: int | None = None,
+) -> int:
+    """Backfill missing daily digests up to `upto` (defaults to yesterday).
+
+    - Iterates ONLY days that actually have messages (skip empty days
+      entirely — 300-day-old channel with sparse traffic ≠ 300 DB probes).
+    - Skips days already digested.
+    - Serialized per channel via an in-process lock; concurrent callers
+      wait rather than double-spend on the same day.
+    - `max_new` caps how many *new* digests one call may create — lets
+      callers offer "prime up to N per pass" pattern without blocking the
+      user for the full backlog on first-ever call.
     """
     upto = upto or (datetime.now(timezone.utc).date() - timedelta(days=1))
+    lock = _channel_locks.setdefault(channel_pk, _asyncio.Lock())
+    async with lock:
+        async with session() as s:
+            ch = (await s.execute(select(Channel).where(Channel.id == channel_pk))).scalar_one_or_none()
+            if ch is None:
+                return 0
+            # Days with messages
+            days_with_msgs = {
+                r[0] for r in (await s.execute(
+                    select(func.date(Message.sent_at))
+                    .where(Message.channel_id == channel_pk)
+                    .distinct()
+                )).all()
+            }
+            # Days already digested
+            done = {
+                r[0] for r in (await s.execute(
+                    select(Digest.scope_key)
+                    .where(Digest.channel_id == channel_pk)
+                    .where(Digest.scope == "day")
+                )).all()
+            }
 
-    async with session() as s:
-        ch = (await s.execute(select(Channel).where(Channel.id == channel_pk))).scalar_one_or_none()
-        if ch is None:
-            return 0
-        rng = (await s.execute(
-            select(Message.sent_at)
-            .where(Message.channel_id == channel_pk)
-            .order_by(Message.sent_at)
-            .limit(1)
-        )).scalar_one_or_none()
-    if rng is None:
-        return 0
-    first_day = rng.date()
+        # date() in postgres returns date objects; scope_key stored as isoformat().
+        pending = sorted(
+            d for d in days_with_msgs
+            if d <= upto and d.isoformat() not in done
+        )
+        if max_new is not None:
+            pending = pending[:max_new]
 
-    generated = 0
-    d = first_day
-    while d <= upto:
-        digest = await _generate_day_digest(ch, d)
-        if digest is not None:
-            # Only count newly created ones (id is fresh).  Cheap approximation:
-            # ensure_digests always writes at most one per day, so this counter
-            # rises monotonically with real work.
-            generated += 1
-        d += timedelta(days=1)
-    return generated
+        generated = 0
+        for d in pending:
+            digest = await _generate_day_digest(ch, d)
+            if digest is not None:
+                generated += 1
+        return generated
 
 
 async def build_context_for_query(
