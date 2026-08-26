@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     model_small: str = Field(default="moonshotai/Kimi-K2.6")
 
     # Embeddings
-    embed_model: str = Field(default="sentence-transformers/all-MiniLM-L6-v2")
+    embed_model: str = Field(default="BAAI/bge-small-en-v1.5")  # fastembed default; 384-dim
     embed_dim: int = Field(default=384)
 
 

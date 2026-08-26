@@ -24,8 +24,9 @@ dependencies = [
     "web3>=7.4",
     "solana>=0.34",
     "solders>=0.21",
-    # Embeddings
-    "sentence-transformers>=3.1",
+    # Embeddings — fastembed = quantized ONNX, ~150 MB total (no torch dep).
+    # Uses BAAI/bge-small-en-v1.5 by default (384-dim, matches embed_dim).
+    "fastembed>=0.4",
     # Config / logging
     "pydantic>=2.9",
     "pydantic-settings>=2.5",
