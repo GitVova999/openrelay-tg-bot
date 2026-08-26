@@ -61,7 +61,7 @@ async def start_with_payload(message: Message, command) -> None:  # type: ignore
         hours = int(arg) if arg.isdigit() else 24
         await _do_summarize(message, hours=hours)
     elif verb == "ask":
-        await _do_ask(message, question=arg)
+        await _do_ask_in_dm(message, question=arg)
 
 
 @router.message(CommandStart())
@@ -130,13 +130,19 @@ async def _do_summarize(msg: Message, hours: int, source_chat_id: int | None = N
 # ─────────────────────────────────────────────────────────── /ask
 
 
+# Threshold below which an /ask answer stays inline in the channel/group.
+# Long answers still route to DM to keep public chat tidy.  Chosen so a
+# ~3-line one-paragraph answer fits without truncation warnings.
+CHANNEL_INLINE_LIMIT_CHARS = 400
+
+
 @router.message(Command("ask"), F.chat.type == PRIVATE)
 async def ask_private(message: Message, command) -> None:  # type: ignore[no-untyped-def]
     q = (command.args or "").strip()
     if not q:
         await message.answer("Пример: <code>/ask о чём был последний спор?</code>")
         return
-    await _do_ask(message, question=q)
+    await _do_ask_in_dm(message, question=q)
 
 
 @router.message(Command("ask"), F.chat.type.in_(NON_PRIVATE))
@@ -145,42 +151,30 @@ async def ask_public(message: Message, command, bot: Bot) -> None:  # type: igno
     if not q:
         await message.reply("Пример: <code>/ask о чём был последний спор?</code>")
         return
-    await _stub_and_relay_to_dm(
-        message, bot,
-        verb="ask", arg=q,
-        run=lambda msg: _do_ask(msg, question=q, source_chat_id=message.chat.id),
-    )
+    await _do_ask_in_channel(message, bot, question=q)
 
 
-async def _do_ask(msg: Message, question: str, source_chat_id: int | None = None) -> None:
-    """Answer a free-form question grounded in the channel's messages.
+async def _generate_ask_answer(
+    channel_tg_id: int,
+    question: str,
+) -> dict:
+    """Run the full /ask pipeline; return {ok, header, body, chunks, lang}.
 
-    Context: last 48 h raw + all older days as cached daily digests.
-    Bounded by channel age × ~600 tok/day (not by message count), so this
-    scales to years of history without exploding the prompt.
+    Kept separate from the send layer so both DM and channel handlers can
+    format-and-route the same result without duplicating the LLM call.
     """
-    chat_id = source_chat_id or await _resolve_default_channel(msg.from_user.id if msg.from_user else 0)
-    if chat_id is None:
-        await msg.answer("Нет зарегистрированного канала. Сначала добавь меня в канал как админа.")
-        return
-
-    thinking = await msg.answer("⏳ Думаю…")
     async with session() as db:
-        ch = (await db.execute(select(Channel).where(Channel.tg_chat_id == chat_id))).scalar_one_or_none()
+        ch = (await db.execute(
+            select(Channel).where(Channel.tg_chat_id == channel_tg_id)
+        )).scalar_one_or_none()
     if ch is None:
-        await thinking.edit_text("Канал не зарегистрирован в базе.")
-        return
+        return {"ok": False, "error": "Канал не зарегистрирован в базе."}
 
-    # 1. Build context from whatever digests + raw are already available.
-    #    Missing digests are backfilled in the BACKGROUND — first /ask on a
-    #    fresh channel is answered with whatever we've got, and quality grows
-    #    over subsequent asks as digests fill in.
     context, stats = await build_context_for_query(ch.id, recent_hours=48)
     if not context:
-        await thinking.edit_text("В канале пока нет распарсенных сообщений.")
-        return
+        return {"ok": False, "error": "В канале пока нет распарсенных сообщений."}
 
-    # Kick off digest catch-up (up to 5 new per pass; caps per-call cost).
+    # Fire background digest warm (bounded per-call) so next /ask has more.
     asyncio.create_task(_background_digest_warm(ch.id, max_new=5))
 
     user_prompt = (
@@ -205,8 +199,7 @@ async def _do_ask(msg: Message, question: str, source_chat_id: int | None = None
             stop=STOP_SEQUENCES,
         )
     except Exception as e:
-        await thinking.edit_text(f"⚠️ Инференс упал: <code>{clean_llm_output(str(e))}</code>")
-        return
+        return {"ok": False, "error": f"Инференс упал: <code>{clean_llm_output(str(e))}</code>"}
 
     raw = j["choices"][0]["message"]["content"]
     lang = (ch.language or "ru").lower()
@@ -220,10 +213,80 @@ async def _do_ask(msg: Message, question: str, source_chat_id: int | None = None
         f"raw:{stats['raw_msgs']} digests:{stats['digest_days']} · "
         f"{j.get('model', '?')}</i>\n\n"
     )
-    chunks = ui.truncate_for_telegram(header + answer)
-    await thinking.edit_text(chunks[0])
-    for extra in chunks[1:]:
+    return {
+        "ok": True,
+        "header": header,
+        "body": answer,
+        "chunks": ui.truncate_for_telegram(header + answer),
+        "lang": lang,
+    }
+
+
+async def _do_ask_in_dm(msg: Message, question: str, source_chat_id: int | None = None) -> None:
+    """DM path — always full answer regardless of length."""
+    chat_id = source_chat_id or await _resolve_default_channel(msg.from_user.id if msg.from_user else 0)
+    if chat_id is None:
+        await msg.answer("Нет зарегистрированного канала. Сначала добавь меня в канал как админа.")
+        return
+
+    thinking = await msg.answer("⏳ Думаю…")
+    res = await _generate_ask_answer(chat_id, question)
+    if not res["ok"]:
+        await thinking.edit_text(f"⚠️ {res['error']}")
+        return
+    await thinking.edit_text(res["chunks"][0])
+    for extra in res["chunks"][1:]:
         await msg.answer(extra)
+
+
+async def _do_ask_in_channel(channel_msg: Message, bot: Bot, question: str) -> None:
+    """Channel/group path.
+
+    - Short answer (≤ CHANNEL_INLINE_LIMIT_CHARS): reply right there in the
+      channel — no reason to force a DM detour for a two-sentence answer.
+    - Long answer: post a short stub in the channel + full answer to the
+      user's DM.  If the user is an anonymous-admin (from_user.is_bot) or
+      never pressed /start, replace the stub with a deep-link they can
+      tap to open DM pre-filled with the same question.
+    """
+    thinking = await channel_msg.reply("⏳ Думаю…")
+    res = await _generate_ask_answer(channel_msg.chat.id, question)
+    if not res["ok"]:
+        await thinking.edit_text(f"⚠️ {res['error']}")
+        return
+
+    # `body` excludes the meta header — length threshold uses the pure answer.
+    body_len = len(res["body"])
+    if body_len <= CHANNEL_INLINE_LIMIT_CHARS:
+        # Short — stays inline. Drop the metadata header for a cleaner look.
+        await thinking.edit_text(res["body"])
+        return
+
+    # Long — route to DM. Deal with the "can't DM" cases first.
+    me = await bot.get_me()
+    user = channel_msg.from_user
+    if user is None or user.is_bot:
+        await thinking.edit_text(
+            "Ответ длинный. Открой в лс — я пришлю туда полный:",
+            reply_markup=ui.deep_link("ask", question),
+        )
+        return
+
+    try:
+        # Full answer to DM (may span multiple messages if > 4 KB).
+        for chunk in res["chunks"]:
+            await bot.send_message(user.id, chunk)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        await thinking.edit_text(
+            ui.stub_need_start(me.username),
+            reply_markup=ui.deep_link("ask", question),
+        )
+        return
+
+    await thinking.edit_text(
+        ui.stub_answer_in_dm(me.username),
+        reply_markup=ui.dm_link(),
+    )
 
 
 async def _background_digest_warm(channel_pk: int, max_new: int = 5) -> None:
