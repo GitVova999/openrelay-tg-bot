@@ -4,31 +4,24 @@ MVP path — direct inference call (no retrieval; whole window fits in-context).
 Once channels grow past ~50k tokens per window we switch to hierarchical
 digests + retrieval; the interface stays the same.
 
-Beta-mode inference: talks to Gonka upstream directly with a shared internal
-API key, bypassing our own x402 payment layer.  This is our own server calling
-our own stack — end users still pay per request via the bot (billing_svc
-records usage → treasury/user-pays flows).  Production path (Simple/Docker
-tiers) will route through OpenRelay so external inference providers can
-plug in without OpenRelay-internal secrets.
+Inference route: OpenRelay /v1/premium/chat/completions with real x402/CDP
+payment from OPENRELAY_WALLET_PRIVATE_KEY.  Full e2e — no Gonka-direct
+bypass — so this exercises the same path external consumers use.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 
-import httpx
 from sqlalchemy import select
 
 from packages.common.config import settings
 from packages.common.db import session
 from packages.common.models import Channel, Message
+from packages.context_svc.openrelay_client import chat_completion
 
 log = logging.getLogger("summarize")
-
-INFERENCE_URL = os.environ.get("INFERENCE_URL", "https://proxy.gonka.gg/v1/chat/completions")
-INFERENCE_KEY = os.environ.get("INFERENCE_KEY", "")
 
 
 async def _fetch_window(channel_id: int, since: datetime | None, limit: int | None) -> list[Message]:
@@ -71,8 +64,6 @@ async def summarize_channel(
 ) -> dict:
     """Return {ok, summary, model, in_tokens_est, msg_count, period}."""
     s = settings()
-    if not INFERENCE_KEY:
-        raise RuntimeError("INFERENCE_KEY env not set (beta bypass)")
 
     if since is None and hours is not None:
         since = datetime.now(timezone.utc) - timedelta(hours=hours)
@@ -94,20 +85,16 @@ async def summarize_channel(
     transcript = _format_transcript(msgs)
     prompt = PROMPT_TEMPLATE.format(title=ch.title, period=period, transcript=transcript)
 
-    async with httpx.AsyncClient(timeout=180) as http:
-        r = await http.post(
-            INFERENCE_URL,
-            headers={"Authorization": f"Bearer {INFERENCE_KEY}", "content-type": "application/json"},
-            json={
-                "model": s.model_large,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_output_tokens,
-                "temperature": 0.4,
-            },
+    try:
+        j = await chat_completion(
+            model=s.model_large,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_output_tokens,
+            temperature=0.4,
         )
-    if r.status_code != 200:
-        return {"ok": False, "error": f"upstream {r.status_code}: {r.text[:200]}"}
-    j = r.json()
+    except Exception as e:
+        return {"ok": False, "error": f"openrelay: {e!s}"[:400]}
+
     summary = j["choices"][0]["message"]["content"]
     usage = j.get("usage", {})
     return {
