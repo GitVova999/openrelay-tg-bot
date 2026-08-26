@@ -139,24 +139,56 @@ CHANNEL_INLINE_LIMIT_CHARS = 400
 @router.message(Command("ask"), F.chat.type == PRIVATE)
 async def ask_private(message: Message, command) -> None:  # type: ignore[no-untyped-def]
     q = (command.args or "").strip()
-    if not q:
-        await message.answer("Пример: <code>/ask о чём был последний спор?</code>")
+    reply_focus = _extract_reply_focus(message)
+    if not q and not reply_focus:
+        await message.answer(
+            "Пример: <code>/ask о чём был последний спор?</code>\n"
+            "Или ответь на пост командой <code>/ask</code> — я поясню его."
+        )
         return
-    await _do_ask_in_dm(message, question=q)
+    if not q:
+        q = "О чём этот пост? Прокомментируй."
+    await _do_ask_in_dm(message, question=q, reply_focus=reply_focus)
 
 
 @router.message(Command("ask"), F.chat.type.in_(NON_PRIVATE))
 async def ask_public(message: Message, command, bot: Bot) -> None:  # type: ignore[no-untyped-def]
     q = (command.args or "").strip()
-    if not q:
-        await message.reply("Пример: <code>/ask о чём был последний спор?</code>")
+    reply_focus = _extract_reply_focus(message)
+    if not q and not reply_focus:
+        await message.reply(
+            "Пример: <code>/ask о чём был последний спор?</code>\n"
+            "Или ответь на пост командой <code>/ask</code> — я поясню его."
+        )
         return
-    await _do_ask_in_channel(message, bot, question=q)
+    if not q:
+        q = "О чём этот пост? Прокомментируй."
+    await _do_ask_in_channel(message, bot, question=q, reply_focus=reply_focus)
+
+
+def _extract_reply_focus(message: Message) -> str | None:
+    """If /ask was sent as a reply to another message, return that message's
+    text/caption in a formatted 'target post' block, or None."""
+    r = message.reply_to_message
+    if r is None:
+        return None
+    text = (r.text or r.caption or "").strip()
+    if not text:
+        return None
+    who = ""
+    if r.from_user:
+        who = r.from_user.username or r.from_user.first_name or ""
+    elif r.sender_chat:
+        who = r.sender_chat.title or ""
+    stamp = r.date.strftime("%Y-%m-%d %H:%M") if r.date else "?"
+    header = f"[{stamp}]" + (f" {who}:" if who else "")
+    return f"{header}\n{text}"
 
 
 async def _generate_ask_answer(
     channel_tg_id: int,
     question: str,
+    reply_focus: str | None = None,
 ) -> dict:
     """Run the full /ask pipeline; return {ok, header, body, chunks, lang}.
 
@@ -177,11 +209,20 @@ async def _generate_ask_answer(
     # Fire background digest warm (bounded per-call) so next /ask has more.
     asyncio.create_task(_background_digest_warm(ch.id, max_new=5))
 
+    focus_block = ""
+    if reply_focus:
+        focus_block = (
+            "ПОСТ-АНКОР (пользователь спрашивает про этот конкретный пост, "
+            "используй его как основной фокус ответа):\n"
+            f"===\n{reply_focus}\n===\n\n"
+        )
+
     user_prompt = (
         f"Ниже — контекст канала: {stats['raw_msgs']} свежих сообщ. за 48ч "
         f"+ {stats['digest_days']} дневных дайджестов старше 48ч.\n"
-        "Ответь на вопрос пользователя, опираясь ТОЛЬКО на этот контекст. "
-        "Если ответа нет — так и скажи. Кратко, по делу.\n\n"
+        + (focus_block if focus_block else "")
+        + "Ответь на вопрос пользователя, опираясь на пост-анкор (если есть) "
+          "и контекст канала. Если ответа нет — так и скажи. Кратко, по делу.\n\n"
         f"КОНТЕКСТ:\n{context}\n\n"
         f"ВОПРОС: {question}"
     )
@@ -222,7 +263,12 @@ async def _generate_ask_answer(
     }
 
 
-async def _do_ask_in_dm(msg: Message, question: str, source_chat_id: int | None = None) -> None:
+async def _do_ask_in_dm(
+    msg: Message,
+    question: str,
+    source_chat_id: int | None = None,
+    reply_focus: str | None = None,
+) -> None:
     """DM path — always full answer regardless of length."""
     chat_id = source_chat_id or await _resolve_default_channel(msg.from_user.id if msg.from_user else 0)
     if chat_id is None:
@@ -230,7 +276,7 @@ async def _do_ask_in_dm(msg: Message, question: str, source_chat_id: int | None 
         return
 
     thinking = await msg.answer("⏳ Думаю…")
-    res = await _generate_ask_answer(chat_id, question)
+    res = await _generate_ask_answer(chat_id, question, reply_focus=reply_focus)
     if not res["ok"]:
         await thinking.edit_text(f"⚠️ {res['error']}")
         return
@@ -239,7 +285,12 @@ async def _do_ask_in_dm(msg: Message, question: str, source_chat_id: int | None 
         await msg.answer(extra)
 
 
-async def _do_ask_in_channel(channel_msg: Message, bot: Bot, question: str) -> None:
+async def _do_ask_in_channel(
+    channel_msg: Message,
+    bot: Bot,
+    question: str,
+    reply_focus: str | None = None,
+) -> None:
     """Channel/group path.
 
     - Short answer (≤ CHANNEL_INLINE_LIMIT_CHARS): reply right there in the
@@ -250,7 +301,7 @@ async def _do_ask_in_channel(channel_msg: Message, bot: Bot, question: str) -> N
       tap to open DM pre-filled with the same question.
     """
     thinking = await channel_msg.reply("⏳ Думаю…")
-    res = await _generate_ask_answer(channel_msg.chat.id, question)
+    res = await _generate_ask_answer(channel_msg.chat.id, question, reply_focus=reply_focus)
     if not res["ok"]:
         await thinking.edit_text(f"⚠️ {res['error']}")
         return
