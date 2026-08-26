@@ -19,7 +19,9 @@ from sqlalchemy import select
 from packages.common.config import settings
 from packages.common.db import session
 from packages.common.models import Channel, Message
+from packages.context_svc.digest import build_context_for_query, ensure_digests
 from packages.context_svc.openrelay_client import chat_completion
+from packages.context_svc.sanitize import strip_reasoning
 
 log = logging.getLogger("summarize")
 
@@ -56,11 +58,16 @@ PROMPT_TEMPLATE = """Ты — аналитик TG-каналов. Ниже — �
 """
 
 
+# If the caller asked for a window > this many hours we skip raw messages and
+# summarize from cached daily digests. Cheaper + fits any window.
+RAW_WINDOW_CAP_HOURS = 48
+
+
 async def summarize_channel(
     tg_chat_id: int,
     hours: int | None = 24,
     since: datetime | None = None,
-    max_output_tokens: int = 600,
+    max_output_tokens: int = 900,
 ) -> dict:
     """Return {ok, summary, model, in_tokens_est, msg_count, period}."""
     s = settings()
@@ -71,19 +78,53 @@ async def summarize_channel(
     async with session() as db:
         ch = (await db.execute(select(Channel).where(Channel.tg_chat_id == tg_chat_id))).scalar_one_or_none()
     if ch is None:
-        return {"ok": False, "error": f"channel {tg_chat_id} not registered"}
+        return {"ok": False, "error": f"канал {tg_chat_id} не зарегистрирован"}
+
+    # Sanity: does the channel have ANY messages, and where do they live?
+    async with session() as db:
+        oldest = (await db.execute(
+            select(Message.sent_at).where(Message.channel_id == ch.id).order_by(Message.sent_at).limit(1)
+        )).scalar_one_or_none()
+        newest = (await db.execute(
+            select(Message.sent_at).where(Message.channel_id == ch.id).order_by(Message.sent_at.desc()).limit(1)
+        )).scalar_one_or_none()
+
+    if oldest is None:
+        return {"ok": False, "error": "в канале ещё нет распарсенных сообщений"}
 
     msgs = await _fetch_window(ch.id, since, limit=None)
     if not msgs:
-        return {"ok": False, "error": "no messages in window"}
+        return {
+            "ok": False,
+            "error": (
+                f"нет сообщений в этом окне.\n"
+                f"Данные канала: c {oldest:%Y-%m-%d} по {newest:%Y-%m-%d}.\n"
+                f"Попробуй /summarize {int((datetime.now(timezone.utc) - oldest).total_seconds() // 3600)+1} "
+                f"(весь канал) или уточни другое окно."
+            ),
+        }
 
-    period = (
-        f"с {msgs[0].sent_at:%Y-%m-%d} по {msgs[-1].sent_at:%Y-%m-%d}"
-        if len(msgs) > 1
-        else f"на {msgs[0].sent_at:%Y-%m-%d}"
+    # Cheap window (< 48 h): send raw messages verbatim.
+    # Big window: pre-compute daily digests + feed digests to model.
+    if hours is not None and hours <= RAW_WINDOW_CAP_HOURS:
+        transcript_block = _format_transcript(msgs)
+        prompt_body = f"===\n{transcript_block}\n==="
+        est_in = len(transcript_block) // 4
+    else:
+        # Make sure digests up to yesterday exist.
+        await ensure_digests(ch.id)
+        context, cstats = await build_context_for_query(ch.id, recent_hours=RAW_WINDOW_CAP_HOURS)
+        prompt_body = context
+        est_in = cstats["context_tokens_est"]
+
+    period = f"с {msgs[0].sent_at:%Y-%m-%d} по {msgs[-1].sent_at:%Y-%m-%d}"
+    prompt = (
+        f"Ты — аналитик TG-каналов. Ниже — контекст канала «{ch.title}» за период {period}.\n"
+        "Сделай краткое саммари: главные темы, повторяющиеся мотивы, тон, что-либо необычное.\n"
+        "Формат: 5-8 буллетов через дефис. Русский язык. Без вступительной фразы, "
+        "без блоков <think>, сразу буллеты.\n\n"
+        + prompt_body
     )
-    transcript = _format_transcript(msgs)
-    prompt = PROMPT_TEMPLATE.format(title=ch.title, period=period, transcript=transcript)
 
     try:
         j = await chat_completion(
@@ -93,17 +134,17 @@ async def summarize_channel(
             temperature=0.4,
         )
     except Exception as e:
-        return {"ok": False, "error": f"openrelay: {e!s}"[:400]}
+        return {"ok": False, "error": f"инференс упал: {e!s}"[:400]}
 
-    summary = j["choices"][0]["message"]["content"]
+    summary = strip_reasoning(j["choices"][0]["message"]["content"])
     usage = j.get("usage", {})
     return {
         "ok": True,
         "summary": summary,
-        "model": s.model_large,
+        "model": j.get("model", s.model_large),
         "period": period,
         "msg_count": len(msgs),
-        "in_tokens": usage.get("prompt_tokens", len(transcript) // 4),
+        "in_tokens": usage.get("prompt_tokens", est_in),
         "out_tokens": usage.get("completion_tokens", 0),
     }
 

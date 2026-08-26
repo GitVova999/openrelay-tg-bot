@@ -28,12 +28,10 @@ from sqlalchemy import func, select
 from packages.bot import ui
 from packages.common.db import session
 from packages.common.models import Channel, Message as DbMessage
+from packages.context_svc.digest import build_context_for_query, ensure_digests
 from packages.context_svc.openrelay_client import chat_completion
-from packages.context_svc.summarize import (
-    _fetch_window,
-    _format_transcript,
-    summarize_channel,
-)
+from packages.context_svc.sanitize import clean_llm_output
+from packages.context_svc.summarize import summarize_channel
 
 log = logging.getLogger("bot.commands")
 router = Router()
@@ -111,10 +109,10 @@ async def _do_summarize(msg: Message, hours: int, source_chat_id: int | None = N
     try:
         res = await summarize_channel(chat_id, hours=hours)
     except Exception as e:
-        await thinking.edit_text(f"⚠️ Ошибка: <code>{e!s}</code>")
+        await thinking.edit_text(f"⚠️ Ошибка: <code>{clean_llm_output(str(e))}</code>")
         return
     if not res["ok"]:
-        await thinking.edit_text(f"⚠️ {res['error']}")
+        await thinking.edit_text(f"⚠️ {clean_llm_output(res['error'])}")
         return
     text = ui.format_summary(res)
     chunks = ui.truncate_for_telegram(text)
@@ -151,9 +149,9 @@ async def ask_public(message: Message, command, bot: Bot) -> None:  # type: igno
 async def _do_ask(msg: Message, question: str, source_chat_id: int | None = None) -> None:
     """Answer a free-form question grounded in the channel's messages.
 
-    MVP: concatenate whole corpus (fits for <100k tok channels; retrieval
-    layer lands in milestone 2). Response is streamed as one block for now
-    — token-by-token streaming is a v0.2 improvement.
+    Context: last 48 h raw + all older days as cached daily digests.
+    Bounded by channel age × ~600 tok/day (not by message count), so this
+    scales to years of history without exploding the prompt.
     """
     chat_id = source_chat_id or await _resolve_default_channel(msg.from_user.id if msg.from_user else 0)
     if chat_id is None:
@@ -166,20 +164,32 @@ async def _do_ask(msg: Message, question: str, source_chat_id: int | None = None
     if ch is None:
         await thinking.edit_text("Канал не зарегистрирован в базе.")
         return
-    msgs = await _fetch_window(ch.id, since=None, limit=None)
-    if not msgs:
+
+    # 1. Materialize daily digests up to yesterday if any are missing.
+    try:
+        new_digests = await ensure_digests(ch.id)
+        if new_digests:
+            await thinking.edit_text(f"⏳ Собираю дайджест ({new_digests} дн.)…")
+    except Exception as e:
+        log.warning("digest build failed: %s", e)
+
+    # 2. Build compact context (recent raw + digests for older days).
+    context, stats = await build_context_for_query(ch.id, recent_hours=48)
+    if not context:
         await thinking.edit_text("В канале пока нет распарсенных сообщений.")
         return
 
-    transcript = _format_transcript(msgs)
     prompt = (
-        f"Ниже — весь публичный контекст канала «{ch.title}» "
-        f"({len(msgs)} сообщ.). Ответь на вопрос пользователя, "
-        "опираясь ТОЛЬКО на этот контекст. Если ответа нет — так и скажи. "
-        "Отвечай на русском, кратко и по делу.\n\n"
-        f"КОНТЕКСТ:\n===\n{transcript}\n===\n\n"
+        f"Ты — AI-помощник канала «{ch.title}». Ниже — контекст: "
+        f"свежие {stats['raw_msgs']} сообщ. за 48ч + {stats['digest_days']} "
+        "дневных дайджестов старше 48ч.\n"
+        "Ответь на вопрос пользователя, опираясь ТОЛЬКО на этот контекст. "
+        "Если ответа в контексте нет — прямо скажи. Русский, кратко, по делу. "
+        "Никаких <think>-блоков.\n\n"
+        f"КОНТЕКСТ:\n{context}\n\n"
         f"ВОПРОС: {question}"
     )
+
     try:
         j = await chat_completion(
             model="deepseek-ai/DeepSeek-V4-Flash-0731",
@@ -188,12 +198,19 @@ async def _do_ask(msg: Message, question: str, source_chat_id: int | None = None
             temperature=0.4,
         )
     except Exception as e:
-        await thinking.edit_text(f"⚠️ Инференс упал: <code>{e!s}</code>")
+        await thinking.edit_text(f"⚠️ Инференс упал: <code>{clean_llm_output(str(e))}</code>")
         return
 
-    answer = j["choices"][0]["message"]["content"]
+    raw = j["choices"][0]["message"]["content"]
+    answer = clean_llm_output(raw)  # strips <think> and escapes remaining HTML
+    if not answer:
+        answer = "(модель ответила пустой строкой после reasoning-блока — попробуй переформулировать)"
     usage = j.get("usage", {})
-    header = f"<b>❓ {question}</b>\n<i>{usage.get('prompt_tokens', 0)}→{usage.get('completion_tokens', 0)} tok</i>\n\n"
+    header = (
+        f"<b>❓ {clean_llm_output(question)}</b>\n"
+        f"<i>{usage.get('prompt_tokens', 0)}→{usage.get('completion_tokens', 0)} tok · "
+        f"raw:{stats['raw_msgs']} digests:{stats['digest_days']}</i>\n\n"
+    )
     chunks = ui.truncate_for_telegram(header + answer)
     await thinking.edit_text(chunks[0])
     for extra in chunks[1:]:
@@ -230,11 +247,11 @@ async def faq(message: Message, command) -> None:  # type: ignore[no-untyped-def
             temperature=0.2,
         )
     except Exception as e:
-        await thinking.edit_text(f"⚠️ <code>{e!s}</code>")
+        await thinking.edit_text(f"⚠️ <code>{clean_llm_output(str(e))}</code>")
         return
-    ans = j["choices"][0]["message"]["content"].strip()
+    ans = clean_llm_output(j["choices"][0]["message"]["content"].strip())
     kb = ui.deep_link("ask", q) if message.chat.type != PRIVATE else None
-    await thinking.edit_text(f"<b>❓ {q}</b>\n{ans}", reply_markup=kb)
+    await thinking.edit_text(f"<b>❓ {clean_llm_output(q)}</b>\n{ans}", reply_markup=kb)
 
 
 # ─────────────────────────────────────────────────────────── /balance

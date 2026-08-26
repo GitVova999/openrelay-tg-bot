@@ -63,12 +63,17 @@ def stub_need_start(bot_username: str) -> str:
 
 
 def format_summary(res: dict) -> str:
-    """Turn summarize_channel(...) result into a nice HTML message."""
+    """Turn summarize_channel(...) result into a nice HTML message.
+
+    We escape the model's output so any residual HTML-looking bits in the
+    summary don't crash the aiogram HTML parser.
+    """
+    from packages.context_svc.sanitize import clean_llm_output
     header = (
         f"<b>📝 Саммари</b> · {res['msg_count']} сообщ. · {res['period']}\n"
         f"<i>Модель: {res['model']} · {res['in_tokens']}→{res['out_tokens']} tok</i>\n"
     )
-    return header + "\n" + res["summary"]
+    return header + "\n" + clean_llm_output(res["summary"])
 
 
 def truncate_for_telegram(text: str, limit: int = 4000) -> list[str]:
